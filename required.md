@@ -1,7 +1,7 @@
-# Requirements Document - BharatSetu AI
+# Requirements Document - Aira
 
 ## 1. Introduction
-**BharatSetu AI** is a voice-first, multilingual technical interview coach designed to bridge the employability gap for students in Tier-2/3 cities in India. The system leverages AWS Generative AI services to provide real-time, oral feedback on technical correctness and communication skills in "Hinglish" and other vernacular languages.
+**Aira** is a voice-first, multilingual technical interview coach designed to bridge the employability gap for students in Tier-2/3 cities in India. The system leverages AWS Generative AI services to provide real-time, oral feedback on technical correctness and communication skills in "Hinglish" and other vernacular languages.
 
 ## 2. User Personas
 * **The Aspirant (Primary):** A final-year college student from a rural or semi-urban area. Good at coding logic but struggles with English fluency. Uses a low-end Android smartphone with 4G/3G data.
