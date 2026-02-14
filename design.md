@@ -1,4 +1,4 @@
-# System Design & Architecture - BharatSetu AI
+# System Design & Architecture - Aira
 
 ## 1. High-Level Architecture
 The system follows a **Serverless, Event-Driven Architecture** built entirely on AWS. This ensures zero idle costs and infinite scalability, essential for a student-focused public impact project.
