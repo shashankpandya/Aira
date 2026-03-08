@@ -1,0 +1,231 @@
+import json
+import urllib.request
+import urllib.error
+import boto3
+import uuid
+import time
+import base64
+import os
+
+# --- 1. AWS CLIENTS ---
+AWS_REGION = os.environ.get('AWS_REGION', 'ap-south-1')
+polly = boto3.client('polly', region_name=AWS_REGION)
+s3 = boto3.client('s3', region_name=AWS_REGION)
+transcribe = boto3.client('transcribe', region_name=AWS_REGION)
+dynamodb = boto3.resource('dynamodb', region_name=AWS_REGION)
+lambda_client = boto3.client('lambda', region_name=AWS_REGION)
+
+# --- 2. CONFIGURATION (FROM ENVIRONMENT VARIABLES) ---
+BUCKET_OUT = os.environ.get('BUCKET_OUT')
+BUCKET_IN = os.environ.get('BUCKET_IN')
+GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
+META_ACCESS_TOKEN = os.environ.get('META_ACCESS_TOKEN')
+META_PHONE_ID = os.environ.get('META_PHONE_ID')
+META_VERIFY_TOKEN = os.environ.get('META_VERIFY_TOKEN')
+DYNAMODB_TABLE = os.environ.get('DYNAMODB_TABLE', 'aira_sessions')
+
+# Initialize DynamoDB table
+table = dynamodb.Table(DYNAMODB_TABLE)
+
+# --- 3. HELPER FUNCTIONS ---
+def send_whatsapp_message(to_number, text=None, audio_link=None, buttons=None):
+    url = f"https://graph.facebook.com/v18.0/{META_PHONE_ID}/messages"
+    headers = {"Authorization": f"Bearer {META_ACCESS_TOKEN}", "Content-Type": "application/json"}
+    
+    if buttons:
+        data = {"messaging_product": "whatsapp", "to": to_number, "type": "interactive", "interactive": {"type": "button", "body": {"text": text}, "action": {"buttons": buttons}}}
+    elif audio_link:
+        data = {"messaging_product": "whatsapp", "to": to_number, "type": "audio", "audio": {"link": audio_link}}
+    elif text:
+        data = {"messaging_product": "whatsapp", "to": to_number, "type": "text", "text": {"body": text}}
+    
+    req = urllib.request.Request(url, data=json.dumps(data).encode("utf-8"), headers=headers)
+    try:
+        urllib.request.urlopen(req)
+    except Exception as e:
+        print(f"Meta Error: {e}")
+
+def ask_gemini(system_instruction, prompt_text, expect_json=True):
+    models = ["gemini-2.5-flash", "gemini-2.0-flash"]
+    last_error = ""
+    
+    for model in models:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}"
+        data = {"systemInstruction": {"parts": [{"text": system_instruction}]}, "contents": [{"parts": [{"text": prompt_text}]}], "generationConfig": {"temperature": 0.7, "responseMimeType": "application/json" if expect_json else "text/plain"}}
+        
+        for attempt in range(3):
+            try:
+                req = urllib.request.Request(url, data=json.dumps(data).encode("utf-8"), headers={"Content-Type": "application/json"})
+                with urllib.request.urlopen(req) as response:
+                    result = json.loads(response.read().decode())
+                    if "content" not in result["candidates"][0]:
+                        raise Exception(f"Google AI Blocked Response (Safety/Filter)")
+                    raw_text = result["candidates"][0]["content"]["parts"][0]["text"].strip()
+                    if expect_json:
+                        return json.loads(raw_text.replace("```json\n", "").replace("```", "").strip())
+                    return raw_text
+            except urllib.error.HTTPError as e:
+                error_body = e.read().decode()
+                last_error = f"HTTP {e.code}: {error_body}"
+                if e.code == 429:
+                    time.sleep(3)
+                    continue
+                elif e.code == 404:
+                    break
+                raise Exception(f"Google API Error: {last_error}")
+    
+    raise Exception(f"Google Failed. Reason: {last_error}")
+
+def generate_and_send_polly_audio(user_phone, text):
+    polly_response = polly.synthesize_speech(Text=text, OutputFormat="mp3", VoiceId="Kajal", Engine="neural")
+    audio_key = f"aira_audio_{uuid.uuid4().hex}.mp3"
+    s3.put_object(Bucket=BUCKET_OUT, Key=audio_key, Body=polly_response['AudioStream'].read(), ContentType="audio/mpeg")
+    presigned_url = s3.generate_presigned_url('get_object', Params={'Bucket': BUCKET_OUT, 'Key': audio_key}, ExpiresIn=3600)
+    send_whatsapp_message(user_phone, audio_link=presigned_url)
+
+def end_interview_routine(user_phone, history):
+    send_whatsapp_message(user_phone, text="📊 Generating your Final Interview Report Card...")
+    try:
+        prompt = f"Review this interview history and provide a final summary with 3 strengths and 3 areas for improvement:\n{history}"
+        report = ask_gemini("You are an expert technical recruiter.", prompt, expect_json=False)
+        send_whatsapp_message(user_phone, text=f"🏆 *FINAL REPORT CARD*\n\n{report}")
+        table.delete_item(Key={'phone_number': user_phone})
+    except Exception as e:
+        send_whatsapp_message(user_phone, text=f"⚠ Failed to generate report. Details: {str(e)}")
+
+# --- 4. MAIN HANDLER ---
+def lambda_handler(event, context):
+    try:
+        http_method = event.get('requestContext', {}).get('http', {}).get('method', '') or event.get('httpMethod', 'POST')
+        
+        if http_method == 'GET':
+            query_params = event.get('queryStringParameters', {})
+            if query_params.get('hub.mode') == 'subscribe':
+                return {"statusCode": 200, "body": query_params.get('hub.challenge')}
+            return {"statusCode": 403}
+        
+        headers = event.get('headers') or {}
+        if headers.get('x-async-task') != 'true':
+            headers['x-async-task'] = 'true'
+            event['headers'] = headers
+            lambda_client.invoke(FunctionName=context.function_name, InvocationType='Event', Payload=json.dumps(event))
+            return {"statusCode": 200, "body": "DELEGATED"}
+        
+        body = json.loads(event.get('body', '{}'))
+        if not ('entry' in body and 'changes' in body['entry'][0]):
+            return {"statusCode": 200}
+        
+        value = body['entry'][0]['changes'][0]['value']
+        if 'messages' not in value:
+            return {"statusCode": 200}
+        
+        msg = value['messages'][0]
+        user_phone = msg['from']
+        
+        try:
+            db_response = table.get_item(Key={'phone_number': user_phone})
+            history = db_response.get('Item', {}).get('history', '')
+            current_question = db_response.get('Item', {}).get('current_question', 'Please introduce yourself.')
+            preference = db_response.get('Item', {}).get('preference', 'both')
+            last_score = int(db_response.get('Item', {}).get('last_score', 5))
+        except Exception:
+            send_whatsapp_message(user_phone, text="⚠ Memory Error. Please try again.")
+            return {"statusCode": 200}
+        
+        if msg['type'] == 'interactive':
+            button_id = msg['interactive']['button_reply']['id']
+            if button_id == 'end_interview':
+                end_interview_routine(user_phone, history)
+            elif button_id == 'text_only':
+                table.put_item(Item={'phone_number': user_phone, 'current_question': current_question, 'history': history, 'preference': 'text', 'last_score': last_score})
+                send_whatsapp_message(user_phone, text="✅ Got it! I will only reply with text from now on.")
+            elif button_id == 'hint':
+                hint = ask_gemini("You are a helpful coach.", f"The user asked for a hint for this question: {current_question}. Provide a brief hint without giving away the full answer.", expect_json=False)
+                send_whatsapp_message(user_phone, text=f"💡 *Hint:* {hint}")
+            return {"statusCode": 200}
+        
+        if msg['type'] == 'document':
+            send_whatsapp_message(user_phone, text="📄 Received your resume! Analyzing your skills...")
+            try:
+                doc_id = msg['document']['id']
+                url_req = urllib.request.Request(f"https://graph.facebook.com/v18.0/{doc_id}", headers={"Authorization": f"Bearer {META_ACCESS_TOKEN}"})
+                media_url = json.loads(urllib.request.urlopen(url_req).read().decode())['url']
+                doc_req = urllib.request.Request(media_url, headers={"Authorization": f"Bearer {META_ACCESS_TOKEN}"})
+                pdf_base64 = base64.b64encode(urllib.request.urlopen(doc_req).read()).decode('utf-8')
+                
+                prompt = """Extract top 3 technical skills from this resume and ask ONE opening evaluation question based on the strongest skill. Return JSON: {"skills": ["skill1", "skill2", "skill3"], "next_question": "...", "professional_rephrasing": "Welcome! I see you have experience in..."}"""
+                eval_json = ask_gemini("You are Aira, an AI interview coach.", prompt, pdf_base64=pdf_base64)
+                
+                table.put_item(Item={'phone_number': user_phone, 'current_question': eval_json.get('next_question', 'Tell me about yourself.'), 'history': '', 'preference': 'both', 'last_score': 5})
+                send_whatsapp_message(user_phone, text=f"*Resume Analyzed!* ✅\n\n{eval_json.get('professional_rephrasing', '')}\n\n*Question:* {eval_json.get('next_question', '')}")
+                generate_and_send_polly_audio(user_phone, f"Resume analyzed. {eval_json.get('next_question', '')}")
+            except Exception as e:
+                send_whatsapp_message(user_phone, text=f"⚠ Analysis failed: {e}")
+            return {"statusCode": 200}
+        
+        if msg['type'] == 'text':
+            student_answer = msg['text']['body']
+            if len(student_answer.strip()) < 2:
+                send_whatsapp_message(user_phone, text="⚠ Your answer was a bit too short! Please try again.")
+                return {"statusCode": 200}
+            
+            if any(word in student_answer.lower() for word in ['end interview', 'stop', 'bye']):
+                end_interview_routine(user_phone, history)
+                return {"statusCode": 200}
+            
+            try:
+                prompt = f"""You are Aira, a highly advanced, human-like AGI technical interview coach.
+
+CRITICAL TASK: First, analyze the User Input. Is it a genuine attempt to answer the technical question, or is it a conversational command/chat?
+
+RULE 1 (Conversational/Command): If the user is just chatting or giving a command (e.g., "skip", "next", "I don't know"), YOU MUST NOT GRADE IT. Set "is_technical": false, and provide a friendly response in "professional_rephrasing", then ask the next question.
+
+RULE 2 (Technical Answer): If they are actively attempting to answer the technical question, YOU MUST GRADE IT. Set "is_technical": true, provide a score (1-10), clean the answer (remove filler words), and provide professional rephrasing.
+
+ADAPTIVE DIFFICULTY: The user's last score was {last_score}/10. Adjust the next question difficulty accordingly.
+
+History: {history}
+Current Question: {current_question}
+User Input: {student_answer}
+
+Respond ONLY in valid JSON: {{"is_technical": true/false, "cleaned_answer": "...", "technical_score": 0-10, "professional_rephrasing": "...", "next_question": "..."}}"""
+                
+                eval_json = ask_gemini("You are Aira.", prompt)
+                
+                is_tech = eval_json.get('is_technical', True)
+                new_score = int(eval_json.get('technical_score', 0)) if is_tech else last_score
+                cleaned_text = eval_json.get('cleaned_answer', student_answer)
+                new_history = history + f" | Q: {current_question} A: {cleaned_text}"
+                
+                table.put_item(Item={'phone_number': user_phone, 'current_question': eval_json.get('next_question', ''), 'history': new_history, 'preference': preference, 'last_score': new_score})
+                
+                if is_tech:
+                    text_summary = f"*Score: {new_score}/10*\n\n*(You said: \"{cleaned_text}\")*\n\n*Correction:* {eval_json.get('professional_rephrasing', '')}\n\n*Next Question:* {eval_json.get('next_question', '')}"
+                    tts_script = f"You scored {new_score}. {eval_json.get('professional_rephrasing', '')} Next question: {eval_json.get('next_question', '')}"
+                else:
+                    text_summary = f"*{eval_json.get('professional_rephrasing', '')}*\n\n*Next Question:* {eval_json.get('next_question', '')}"
+                    tts_script = f"{eval_json.get('professional_rephrasing', '')} {eval_json.get('next_question', '')}"
+                
+                send_whatsapp_message(user_phone, text=text_summary, buttons=[{"type": "reply", "reply": {"id": "hint", "title": "💡 Hint"}}, {"type": "reply", "reply": {"id": "text_only", "title": "📝 Text Only"}}, {"type": "reply", "reply": {"id": "end_interview", "title": "🛑 End Interview"}}])
+                
+                if preference != 'text':
+                    generate_and_send_polly_audio(user_phone, tts_script)
+            except Exception as e:
+                send_whatsapp_message(user_phone, text=f"⚠ Aira Error: {str(e)}")
+            return {"statusCode": 200}
+        
+        if msg['type'] == 'audio':
+            send_whatsapp_message(user_phone, text="🎙 Listening to your audio... please wait.")
+            media_id = msg['audio']['id']
+            url_req = urllib.request.Request(f"https://graph.facebook.com/v18.0/{media_id}", headers={"Authorization": f"Bearer {META_ACCESS_TOKEN}"})
+            media_url = json.loads(urllib.request.urlopen(url_req).read().decode())['url']
+            audio_req = urllib.request.Request(media_url, headers={"Authorization": f"Bearer {META_ACCESS_TOKEN}"})
+            s3.put_object(Bucket=BUCKET_IN, Key=f"{media_id}.ogg", Body=urllib.request.urlopen(audio_req).read())
+            
+            job_name = f"job_{user_phone}_{uuid.uuid4().hex[:8]}"
+            transcribe.start_transcription_job(TranscriptionJobName=job_name, Media={'MediaFileUri': f"s3://{BUCKET_IN}/{media_id}.ogg"}, MediaFormat='ogg', LanguageCode='en-IN', Settings={'ShowAlternatives': False, 'MaxSpeakerLabels': 1})
+            return {"statusCode": 200}
+    
+    except Exception as e:
+        print(f"Global Pipeline Error: {e}")
+        return {"statusCode": 500}
