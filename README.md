@@ -410,7 +410,7 @@ This project is licensed under the MIT License - see [LICENSE](LICENSE) file for
 
 ## 📧 Contact
 
-For questions or feedback, reach out at [your-email@example.com]
+For questions or feedback, reach out at [pandyashashank1@gmail.com]
 
 ---
 
