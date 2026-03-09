@@ -1,5 +1,4 @@
 
-
 import json
 import urllib.request
 import urllib.error
@@ -20,23 +19,20 @@ lambda_client = boto3.client('lambda', region_name=AWS_REGION)
 
 table = dynamodb.Table('aira_sessions')
 
-
 # --- 2. CONFIGURATION ---
 BUCKET_OUT = "" 
 BUCKET_IN = ""   
 GEMINI_API_KEY = ""
 META_ACCESS_TOKEN = ""
 META_PHONE_ID = ""
-META_VERIFY_TOKEN = ""
-
-# MAGIC FIX: Splitting the URLs so the text editor cannot corrupt them with Markdown links
-FB_BASE_URL = "https://" + "graph.facebook.com/v18.0/"
-GEMINI_BASE_URL = "https://" + "generativelanguage.googleapis.com/v1beta/models/"
+# META_VERIFY_TOKEN = ""
 
 # --- 3. HELPER FUNCTIONS ---
 def send_whatsapp_message(to_number, text=None, audio_link=None, buttons=None):
-    url = FB_BASE_URL + META_PHONE_ID + "/messages"
-    headers = {"Authorization": "Bearer " + META_ACCESS_TOKEN, "Content-Type": "application/json"}
+    # Anti-Markdown Shield
+    domain = "graph" + ".facebook" + ".com"
+    url = "https://" + domain + "/v18.0/" + META_PHONE_ID.strip() + "/messages"
+    headers = {"Authorization": "Bearer " + META_ACCESS_TOKEN.strip(), "Content-Type": "application/json"}
     
     if buttons:
         data = {"messaging_product": "whatsapp", "to": to_number, "type": "interactive", "interactive": {"type": "button", "body": {"text": text}, "action": {"buttons": buttons}}}
@@ -56,7 +52,9 @@ def ask_gemini(system_instruction, prompt_text, pdf_base64=None, expect_json=Tru
     last_error = "" 
     
     for model in models:
-        url = GEMINI_BASE_URL + model + ":generateContent?key=" + GEMINI_API_KEY
+        # Anti-Markdown Shield
+        domain = "generativelanguage" + ".googleapis" + ".com"
+        url = "https://" + domain + "/v1beta/models/" + model + ":generateContent?key=" + GEMINI_API_KEY.strip()
         
         parts = [{"text": prompt_text}]
         if pdf_base64:
@@ -99,7 +97,7 @@ def ask_gemini(system_instruction, prompt_text, pdf_base64=None, expect_json=Tru
 
 def generate_and_send_polly_audio(user_phone, text):
     polly_response = polly.synthesize_speech(Text=text, OutputFormat="mp3", VoiceId="Kajal", Engine="neural", LanguageCode="en-IN")
-    audio_key = "aira_audio_" + uuid.uuid4().hex + ".mp3"
+    audio_key = f"aira_audio_{uuid.uuid4().hex}.mp3"
     s3.put_object(Bucket=BUCKET_OUT, Key=audio_key, Body=polly_response['AudioStream'].read(), ContentType='audio/mpeg')
     presigned_url = s3.generate_presigned_url('get_object', Params={'Bucket': BUCKET_OUT, 'Key': audio_key}, ExpiresIn=3600)
     send_whatsapp_message(user_phone, audio_link=presigned_url)
@@ -165,9 +163,14 @@ def lambda_handler(event, context):
             send_whatsapp_message(user_phone, text="📄 Received your resume! Analyzing your skills...")
             try:
                 doc_id = msg['document']['id']
-                url_req = urllib.request.Request(FB_BASE_URL + doc_id, headers={"Authorization": "Bearer " + META_ACCESS_TOKEN})
+                
+                # Anti-Markdown Shield for Graph API
+                domain = "graph" + ".facebook" + ".com"
+                graph_url = "https://" + domain + "/v18.0/" + doc_id
+                
+                url_req = urllib.request.Request(graph_url, headers={"Authorization": "Bearer " + META_ACCESS_TOKEN.strip()})
                 media_url = json.loads(urllib.request.urlopen(url_req).read().decode())['url']
-                doc_req = urllib.request.Request(media_url, headers={"Authorization": "Bearer " + META_ACCESS_TOKEN, "User-Agent": "Mozilla/5.0"})
+                doc_req = urllib.request.Request(media_url, headers={"Authorization": "Bearer " + META_ACCESS_TOKEN.strip(), "User-Agent": "Mozilla/5.0"})
                 pdf_base64 = base64.b64encode(urllib.request.urlopen(doc_req).read()).decode('utf-8')
 
                 prompt = """Extract top 3 technical skills from this resume and ask ONE opening interview question. Respond ONLY in JSON: {"technical_score": 0, "professional_rephrasing": "Identified skills: ...", "next_question": "..."}"""
@@ -178,7 +181,7 @@ def lambda_handler(event, context):
                 send_whatsapp_message(user_phone, text=f"*Resume Analyzed!* ✅\n\n{eval_json.get('professional_rephrasing', '')}\n\n*Your first question:* {eval_json.get('next_question', '')}", buttons=[{"type": "reply", "reply": {"id": "text_only", "title": "📝 Text Only Mode"}}, {"type": "reply", "reply": {"id": "hint", "title": "💡 Hint"}}, {"type": "reply", "reply": {"id": "end_interview", "title": "🛑 End Interview"}}])
                 generate_and_send_polly_audio(user_phone, f"Resume analyzed. {eval_json.get('next_question', '')}")
             except Exception as e:
-                send_whatsapp_message(user_phone, text=f"⚠️ Analysis failed: {str(e)}")
+                send_whatsapp_message(user_phone, text=f"⚠️ Analysis failed: {e}")
             return {"statusCode": 200}
 
         if msg['type'] == 'text':
@@ -236,13 +239,18 @@ def lambda_handler(event, context):
         if msg['type'] == 'audio':
             send_whatsapp_message(user_phone, text="🎙️ Listening to your audio... please wait.")
             media_id = msg['audio']['id']
-            url_req = urllib.request.Request(FB_BASE_URL + media_id, headers={"Authorization": "Bearer " + META_ACCESS_TOKEN})
+            
+            # Anti-Markdown Shield
+            domain = "graph" + ".facebook" + ".com"
+            graph_url = "https://" + domain + "/v18.0/" + media_id
+            
+            url_req = urllib.request.Request(graph_url, headers={"Authorization": "Bearer " + META_ACCESS_TOKEN.strip()})
             media_url = json.loads(urllib.request.urlopen(url_req).read().decode())['url']
-            audio_req = urllib.request.Request(media_url, headers={"Authorization": "Bearer " + META_ACCESS_TOKEN, "User-Agent": "Mozilla/5.0"})
-            s3.put_object(Bucket=BUCKET_IN, Key=media_id+".ogg", Body=urllib.request.urlopen(audio_req).read())
+            audio_req = urllib.request.Request(media_url, headers={"Authorization": "Bearer " + META_ACCESS_TOKEN.strip(), "User-Agent": "Mozilla/5.0"})
+            s3.put_object(Bucket=BUCKET_IN, Key=f"{media_id}.ogg", Body=urllib.request.urlopen(audio_req).read())
 
-            job_name = "job_" + user_phone + "_" + uuid.uuid4().hex[:8]
-            transcribe.start_transcription_job(TranscriptionJobName=job_name, Media={'MediaFileUri': "s3://" + BUCKET_IN + "/" + media_id + ".ogg"}, MediaFormat='ogg', IdentifyLanguage=True, LanguageOptions=["en-IN", "hi-IN"])
+            job_name = f"job_{user_phone}_{uuid.uuid4().hex[:8]}"
+            transcribe.start_transcription_job(TranscriptionJobName=job_name, Media={'MediaFileUri': f"s3://{BUCKET_IN}/{media_id}.ogg"}, MediaFormat='ogg', IdentifyLanguage=True, LanguageOptions=["en-IN", "hi-IN"])
             return {"statusCode": 200}
 
     except Exception as e:
