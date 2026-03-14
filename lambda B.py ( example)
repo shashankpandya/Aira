@@ -1,89 +1,66 @@
-import json
-import urllib.request
-import urllib.error
-import boto3
-import uuid
-import time
-import os
-import re
+import json, urllib.request, urllib.error, boto3, uuid, time, os, re
 
-# --- 1. AWS CLIENTS ---
 AWS_REGION = os.environ.get('AWS_REGION', 'ap-south-1')
 polly = boto3.client('polly', region_name=AWS_REGION)
 s3 = boto3.client('s3', region_name=AWS_REGION)
 transcribe = boto3.client('transcribe', region_name=AWS_REGION)
 dynamodb = boto3.resource('dynamodb', region_name=AWS_REGION)
-table = dynamodb.Table('aira_sessions')
+table = dynamodb.Table('')
 
 # --- 2. CONFIGURATION ---
 BUCKET_OUT = "" 
-GEMINI_API_KEY = ""
+GEMINI_API_KEYS = [
+    "",
+    "",
+    "",
+    "",
+    ""
+]
+
 META_ACCESS_TOKEN = ""
 META_PHONE_ID = ""
 
-# --- 3. HELPER FUNCTIONS ---
+FB_BASE_URL = "https://" + "graph.facebook.com/v18.0/"
+GEMINI_BASE_URL = "https://" + "generativelanguage.googleapis.com/v1beta/models/"
+
 def send_whatsapp_message(to_number, text=None, audio_link=None, buttons=None):
-    # Anti-Markdown Shield
-    domain = "graph" + ".facebook" + ".com"
-    url = "https://" + domain + "/v18.0/" + META_PHONE_ID.strip() + "/messages"
+    url = FB_BASE_URL + META_PHONE_ID.strip() + "/messages"
     headers = {"Authorization": "Bearer " + META_ACCESS_TOKEN.strip(), "Content-Type": "application/json"}
-    
-    if buttons:
-        data = {"messaging_product": "whatsapp", "to": to_number, "type": "interactive", "interactive": {"type": "button", "body": {"text": text}, "action": {"buttons": buttons}}}
-    elif audio_link:
-        data = {"messaging_product": "whatsapp", "to": to_number, "type": "audio", "audio": {"link": audio_link}}
-    elif text:
-        data = {"messaging_product": "whatsapp", "to": to_number, "type": "text", "text": {"body": text}}
-        
+    if buttons: data = {"messaging_product": "whatsapp", "to": to_number, "type": "interactive", "interactive": {"type": "button", "body": {"text": text}, "action": {"buttons": buttons}}}
+    elif audio_link: data = {"messaging_product": "whatsapp", "to": to_number, "type": "audio", "audio": {"link": audio_link}}
+    elif text: data = {"messaging_product": "whatsapp", "to": to_number, "type": "text", "text": {"body": text}}
     req = urllib.request.Request(url, data=json.dumps(data).encode("utf-8"), headers=headers)
-    try:
-        urllib.request.urlopen(req)
-    except Exception as e:
-        print(f"Meta Error: {e}")
+    try: urllib.request.urlopen(req)
+    except urllib.error.HTTPError as e: print(f"Meta Error: {e.code} - {e.read().decode()}")
 
 def ask_gemini(system_instruction, prompt_text, expect_json=True):
     models = ["gemini-2.5-flash", "gemini-2.0-flash"]
     last_error = "" 
-    
-    for model in models:
-        # Anti-Markdown Shield
-        domain = "generativelanguage" + ".googleapis" + ".com"
-        url = "https://" + domain + "/v1beta/models/" + model + ":generateContent?key=" + GEMINI_API_KEY.strip()
-        
-        data = {"systemInstruction": {"parts": [{"text": system_instruction}]}, "contents": [{"parts": [{"text": prompt_text}]}]}
-        
-        for attempt in range(3):
-            try:
-                req = urllib.request.Request(url, data=json.dumps(data).encode("utf-8"), headers={"Content-Type": "application/json"})
-                with urllib.request.urlopen(req) as response:
-                    result = json.loads(response.read().decode())
-                    if "content" not in result.get("candidates", [{}])[0]:
-                        raise Exception("Google AI Blocked Response")
-                    
-                    raw_text = result["candidates"][0]["content"]["parts"][0]["text"].strip()
-                    
-                    if expect_json:
-                        match = re.search(r'\{.*\}', raw_text, re.DOTALL)
-                        if match:
-                            try:
-                                return json.loads(match.group(0))
-                            except Exception:
-                                pass
-                        clean_json = raw_text.replace("```json\n", "").replace("```json", "").replace("```", "").strip()
-                        return json.loads(clean_json)
-                    return raw_text
-                    
-            except urllib.error.HTTPError as e:
-                error_body = e.read().decode()
-                last_error = f"HTTP {e.code}: {error_body}"
-                if e.code == 429:
-                    time.sleep(3 * (attempt + 1))
-                    continue
-                elif e.code == 404:
-                    break 
-                raise Exception(f"Google API Error: {last_error}")
-                
-    raise Exception(f"Google Failed. Reason: {last_error}")
+    for api_key in GEMINI_API_KEYS:
+        if not api_key: continue
+        for model in models:
+            url = GEMINI_BASE_URL + model + ":generateContent?key=" + api_key.strip()
+            data = {"systemInstruction": {"parts": [{"text": system_instruction}]}, "contents": [{"parts": [{"text": prompt_text}]}]}
+            for attempt in range(2):
+                try:
+                    req = urllib.request.Request(url, data=json.dumps(data).encode("utf-8"), headers={"Content-Type": "application/json"})
+                    with urllib.request.urlopen(req) as response:
+                        result = json.loads(response.read().decode())
+                        if "content" not in result.get("candidates", [{}])[0]: raise Exception("Google AI Blocked Response")
+                        raw_text = result["candidates"][0]["content"]["parts"][0]["text"].strip()
+                        if expect_json:
+                            match = re.search(r'\{.*\}', raw_text, re.DOTALL)
+                            if match:
+                                try: return json.loads(match.group(0))
+                                except Exception: pass
+                            clean_json = raw_text.replace("```json\n", "").replace("```json", "").replace("```", "").strip()
+                            return json.loads(clean_json)
+                        return raw_text
+                except urllib.error.HTTPError as e:
+                    last_error = f"HTTP {e.code}: {e.read().decode()}"
+                    if e.code in [429, 500, 503]: time.sleep(2); continue
+                    else: break
+    raise Exception(f"All API Keys/Models Failed. Last Error: {last_error}")
 
 def generate_and_send_polly_audio(user_phone, text):
     polly_response = polly.synthesize_speech(Text=text, OutputFormat="mp3", VoiceId="Kajal", Engine="neural", LanguageCode="en-IN")
@@ -97,22 +74,20 @@ def end_interview_routine(user_phone, history):
     try:
         prompt = f"Review this interview history and provide a final summary with 3 strengths and 2 areas for improvement. Format nicely. History: {history}"
         report = ask_gemini("You are an expert technical recruiter.", prompt, expect_json=False)
-        send_whatsapp_message(user_phone, text=f"🏆 *FINAL REPORT CARD*\n\n{report}")
+        safe_report = str(report).replace('*', '').replace('_', '')
+        send_whatsapp_message(user_phone, text=f"🏆 FINAL REPORT CARD\n\n{safe_report}")
         table.delete_item(Key={'phone_number': user_phone})
-    except Exception as e:
-        send_whatsapp_message(user_phone, text=f"⚠️ Failed to generate report. Details: {str(e)}")
+    except Exception as e: send_whatsapp_message(user_phone, text=f"⚠️ Failed to generate report: {str(e)}")
 
-# --- 4. MAIN EVENTBRIDGE HANDLER ---
 def lambda_handler(event, context):
+    user_phone = None
     try:
         job_name = event['detail']['TranscriptionJobName']
         status = event['detail']['TranscriptionJobStatus']
-        
-        try:
-            user_phone = job_name.split('_')[1]
-        except IndexError:
-            return
+        try: user_phone = job_name.split('_')[1]
+        except IndexError: return
 
+        if status != 'COMPLETED' and status != 'FAILED': return {"statusCode": 200, "body": "Ignored"}
         if status == 'FAILED':
             send_whatsapp_message(user_phone, text="⚠️ The audio was too distorted to process. Could you try again?")
             return
@@ -120,9 +95,11 @@ def lambda_handler(event, context):
         job_info = transcribe.get_transcription_job(TranscriptionJobName=job_name)
         transcript_uri = job_info['TranscriptionJob']['Transcript']['TranscriptFileUri']
         with urllib.request.urlopen(transcript_uri) as res:
-            student_answer = json.loads(res.read().decode('utf-8'))['results']['transcripts'][0]['transcript']
+            transcript_data = json.loads(res.read().decode('utf-8'))
+            
+        try: student_answer = transcript_data['results']['transcripts'][0]['transcript']
+        except (KeyError, IndexError): student_answer = ""
 
-        # Short audio guardrail
         if len(student_answer.strip()) < 2:
             send_whatsapp_message(user_phone, text="⚠️ I couldn't clearly hear your answer. Could you please try recording it again?")
             return {"statusCode": 200}
@@ -133,53 +110,47 @@ def lambda_handler(event, context):
         preference = db_response.get('Item', {}).get('preference', 'both')
         last_score = int(db_response.get('Item', {}).get('last_score', 5))
 
-        # Hard Voice Command Check
         if any(word in student_answer.lower() for word in ['end interview', 'stop interview', 'finish interview']):
             end_interview_routine(user_phone, history)
             return {"statusCode": 200}
 
         prompt = f"""You are Aira, a highly advanced, human-like AGI technical interview coach. 
-
         CRITICAL TASK: First, analyze the User Input. Is it a genuine attempt to answer the technical question, OR is it just a conversational command (e.g., 'continue', 'okay', 'next', 'let's do blockchain', 'I am ready', 'skip')?
-
         RULE 1 (Conversational/Command): If the user is just chatting or giving a command, YOU MUST set "is_technical" to false. DO NOT grade them. Place your friendly, natural conversational reply into the "professional_rephrasing" field. 
         RULE 2 (Technical Answer): If they are actively attempting to answer the technical question, set "is_technical" to true. Clean their answer of filler words, grade their accuracy, and provide a professional correction.
-
         ADAPTIVE DIFFICULTY: The user's last score was {last_score}/10. Adjust the next question's difficulty accordingly.
-        
         History: {history}
         Current Question: {current_question}
         User Input: {student_answer}
-        
         Respond ONLY in valid JSON: {{"is_technical": true/false, "cleaned_answer": "...", "technical_score": 8, "professional_rephrasing": "...", "next_question": "..."}}"""
         
-        try:
-            eval_json = ask_gemini("You are Aira.", prompt)
+        try: eval_json = ask_gemini("You are Aira.", prompt)
         except Exception as e:
-            send_whatsapp_message(user_phone, text=f"⚠️ Aira Error: {str(e)}")
+            send_whatsapp_message(user_phone, text=f"⚠️ Aira AI Error: {str(e)}")
             return {"statusCode": 200}
         
         is_tech = eval_json.get('is_technical', True)
         new_score = int(eval_json.get('technical_score', 0)) if is_tech else last_score
-        cleaned_text = eval_json.get('cleaned_answer', student_answer) 
+        
+        cleaned_text = str(eval_json.get('cleaned_answer', student_answer)).replace('*', '').replace('_', '')
+        safe_rephrasing = str(eval_json.get('professional_rephrasing', '')).replace('*', '').replace('_', '')
+        safe_next_question = str(eval_json.get('next_question', '')).replace('*', '').replace('_', '')
         
         new_history = history + f" | Q: {current_question} A: {cleaned_text}"
-        table.put_item(Item={'phone_number': user_phone, 'current_question': eval_json.get('next_question', ''), 'history': new_history, 'preference': preference, 'last_score': new_score})
+        table.put_item(Item={'phone_number': user_phone, 'current_question': safe_next_question, 'history': new_history, 'preference': preference, 'last_score': new_score})
 
         if is_tech:
-            text_summary = f"*Score: {new_score}/10*\n\n*(You said: \"{cleaned_text}\")*\n\n*Correction:* {eval_json.get('professional_rephrasing', '')}\n\n*Next Question:* {eval_json.get('next_question', '')}"
-            tts_script = f"You scored {new_score}. {eval_json.get('professional_rephrasing', '')} {eval_json.get('next_question', '')}"
+            text_summary = f"Score: {new_score}/10\n\nYou said: {cleaned_text}\n\nCorrection: {safe_rephrasing}\n\nNext Question: {safe_next_question}"
+            tts_script = f"You scored {new_score}. {safe_rephrasing} {safe_next_question}"
         else:
-            text_summary = f"*{eval_json.get('professional_rephrasing', '')}*\n\n*Next Question:* {eval_json.get('next_question', '')}"
-            tts_script = f"{eval_json.get('professional_rephrasing', '')} {eval_json.get('next_question', '')}"
+            text_summary = f"{safe_rephrasing}\n\nNext Question: {safe_next_question}"
+            tts_script = f"{safe_rephrasing} {safe_next_question}"
 
-        send_whatsapp_message(user_phone, text=text_summary, buttons=[{"type": "reply", "reply": {"id": "hint", "title": "💡 Hint"}}, {"type": "reply", "reply": {"id": "end_interview", "title": "🛑 End Interview"}}])
-        
-        if preference != 'text':
-            generate_and_send_polly_audio(user_phone, tts_script)
+        send_whatsapp_message(user_phone, text=text_summary)
+        if preference != 'text': generate_and_send_polly_audio(user_phone, tts_script)
+        send_whatsapp_message(user_phone, text="Select an option:", buttons=[{"type": "reply", "reply": {"id": "hint", "title": "💡 Hint"}}, {"type": "reply", "reply": {"id": "end_interview", "title": "🛑 End Interview"}}])
             
         return {"statusCode": 200, "body": "SUCCESS"}
-
     except Exception as e:
-        print(f"Error Processing Audio: {e}")
+        if user_phone: send_whatsapp_message(user_phone, text=f"⚠️ System Crash in Lambda B: {str(e)}")
         return {"statusCode": 500}
