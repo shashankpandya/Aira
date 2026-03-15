@@ -16,21 +16,30 @@ transcribe = boto3.client('transcribe', region_name=AWS_REGION)
 dynamodb = boto3.resource('dynamodb', region_name=AWS_REGION)
 lambda_client = boto3.client('lambda', region_name=AWS_REGION)
 
-table = dynamodb.Table('aira_sessions')
+table = dynamodb.Table('')
 
 # --- 2. CONFIGURATION ---
 BUCKET_OUT = "" 
 BUCKET_IN = ""   
-GEMINI_API_KEY = ""
+
+GEMINI_API_KEYS = [
+    "",
+    "",
+    "",
+    "",
+    ""
+]
+
 META_ACCESS_TOKEN = ""
 META_PHONE_ID = ""
-# META_VERIFY_TOKEN = ""
+
+# Anti-Markdown Shield
+FB_BASE_URL = "https://" + "graph.facebook.com/v18.0/"
+GEMINI_BASE_URL = "https://" + "generativelanguage.googleapis.com/v1beta/models/"
 
 # --- 3. HELPER FUNCTIONS ---
 def send_whatsapp_message(to_number, text=None, audio_link=None, buttons=None):
-    # Anti-Markdown Shield
-    domain = "graph" + ".facebook" + ".com"
-    url = "https://" + domain + "/v18.0/" + META_PHONE_ID.strip() + "/messages"
+    url = FB_BASE_URL + META_PHONE_ID.strip() + "/messages"
     headers = {"Authorization": "Bearer " + META_ACCESS_TOKEN.strip(), "Content-Type": "application/json"}
     
     if buttons:
@@ -50,49 +59,50 @@ def ask_gemini(system_instruction, prompt_text, pdf_base64=None, expect_json=Tru
     models = ["gemini-2.5-flash", "gemini-2.0-flash"]
     last_error = "" 
     
-    for model in models:
-        # Anti-Markdown Shield
-        domain = "generativelanguage" + ".googleapis" + ".com"
-        url = "https://" + domain + "/v1beta/models/" + model + ":generateContent?key=" + GEMINI_API_KEY.strip()
-        
-        parts = [{"text": prompt_text}]
-        if pdf_base64:
-            parts.append({"inlineData": {"mimeType": "application/pdf", "data": pdf_base64}})
+    # Failover Routing: Loops through every API key provided
+    for api_key in GEMINI_API_KEYS:
+        if not api_key or "PASTE_KEY" in api_key: 
+            continue
             
-        data = {"systemInstruction": {"parts": [{"text": system_instruction}]}, "contents": [{"parts": parts}]}
-        
-        for attempt in range(3):
-            try:
-                req = urllib.request.Request(url, data=json.dumps(data).encode("utf-8"), headers={"Content-Type": "application/json"})
-                with urllib.request.urlopen(req) as response:
-                    result = json.loads(response.read().decode())
-                    if "content" not in result.get("candidates", [{}])[0]:
-                        raise Exception("Google AI Blocked Response")
-                    
-                    raw_text = result["candidates"][0]["content"]["parts"][0]["text"].strip()
-                    
-                    if expect_json:
-                        match = re.search(r'\{.*\}', raw_text, re.DOTALL)
-                        if match:
-                            try:
-                                return json.loads(match.group(0))
-                            except Exception:
-                                pass
-                        clean_json = raw_text.replace("```json\n", "").replace("```json", "").replace("```", "").strip()
-                        return json.loads(clean_json)
-                    return raw_text
-                    
-            except urllib.error.HTTPError as e:
-                error_body = e.read().decode()
-                last_error = f"HTTP {e.code}: {error_body}"
-                if e.code == 429:
-                    time.sleep(3 * (attempt + 1))
-                    continue
-                elif e.code == 404:
-                    break 
-                raise Exception(f"Google API Error: {last_error}")
+        for model in models:
+            url = GEMINI_BASE_URL + model + ":generateContent?key=" + api_key.strip()
+            
+            parts = [{"text": prompt_text}]
+            if pdf_base64:
+                parts.append({"inlineData": {"mimeType": "application/pdf", "data": pdf_base64}})
                 
-    raise Exception(f"Google Failed. Reason: {last_error}")
+            data = {"systemInstruction": {"parts": [{"text": system_instruction}]}, "contents": [{"parts": parts}]}
+            
+            for attempt in range(2): # 2 attempts per model/key combination
+                try:
+                    req = urllib.request.Request(url, data=json.dumps(data).encode("utf-8"), headers={"Content-Type": "application/json"})
+                    with urllib.request.urlopen(req) as response:
+                        result = json.loads(response.read().decode())
+                        if "content" not in result.get("candidates", [{}])[0]:
+                            raise Exception("Google AI Blocked Response")
+                        
+                        raw_text = result["candidates"][0]["content"]["parts"][0]["text"].strip()
+                        
+                        if expect_json:
+                            match = re.search(r'\{.*\}', raw_text, re.DOTALL)
+                            if match:
+                                try: return json.loads(match.group(0))
+                                except Exception: pass
+                            clean_json = raw_text.replace("```json\n", "").replace("```json", "").replace("```", "").strip()
+                            return json.loads(clean_json)
+                        return raw_text
+                        
+                except urllib.error.HTTPError as e:
+                    error_body = e.read().decode()
+                    last_error = f"HTTP {e.code}: {error_body}"
+                    # Catch Rate Limits (429) AND Google Server Crashes (500, 503)
+                    if e.code in [429, 500, 503]:
+                        time.sleep(2)
+                        continue
+                    else:
+                        break # Break attempt loop, try next model or next API Key
+                    
+    raise Exception(f"All API Keys and Models Failed. Last Error: {last_error}")
 
 def generate_and_send_polly_audio(user_phone, text):
     polly_response = polly.synthesize_speech(Text=text, OutputFormat="mp3", VoiceId="Kajal", Engine="neural", LanguageCode="en-IN")
@@ -162,11 +172,7 @@ def lambda_handler(event, context):
             send_whatsapp_message(user_phone, text="📄 Received your resume! Analyzing your skills...")
             try:
                 doc_id = msg['document']['id']
-                
-                # Anti-Markdown Shield for Graph API
-                domain = "graph" + ".facebook" + ".com"
-                graph_url = "https://" + domain + "/v18.0/" + doc_id
-                
+                graph_url = FB_BASE_URL + doc_id
                 url_req = urllib.request.Request(graph_url, headers={"Authorization": "Bearer " + META_ACCESS_TOKEN.strip()})
                 media_url = json.loads(urllib.request.urlopen(url_req).read().decode())['url']
                 doc_req = urllib.request.Request(media_url, headers={"Authorization": "Bearer " + META_ACCESS_TOKEN.strip(), "User-Agent": "Mozilla/5.0"})
@@ -177,8 +183,11 @@ def lambda_handler(event, context):
                 
                 table.put_item(Item={'phone_number': user_phone, 'current_question': eval_json.get('next_question', ''), 'history': f"Opening Question: {eval_json.get('next_question', '')}", 'preference': 'both', 'last_score': 5})
                 
-                send_whatsapp_message(user_phone, text=f"*Resume Analyzed!* ✅\n\n{eval_json.get('professional_rephrasing', '')}\n\n*Your first question:* {eval_json.get('next_question', '')}", buttons=[{"type": "reply", "reply": {"id": "text_only", "title": "📝 Text Only Mode"}}, {"type": "reply", "reply": {"id": "hint", "title": "💡 Hint"}}, {"type": "reply", "reply": {"id": "end_interview", "title": "🛑 End Interview"}}])
+                cv_text = f"*Resume Analyzed!* ✅\n\n{eval_json.get('professional_rephrasing', '')}\n\n*Your first question:* {eval_json.get('next_question', '')}"
+                send_whatsapp_message(user_phone, text=cv_text)
+                
                 generate_and_send_polly_audio(user_phone, f"Resume analyzed. {eval_json.get('next_question', '')}")
+                send_whatsapp_message(user_phone, text="Interview Options:", buttons=[{"type": "reply", "reply": {"id": "text_only", "title": "📝 Text Only Mode"}}, {"type": "reply", "reply": {"id": "hint", "title": "💡 Hint"}}, {"type": "reply", "reply": {"id": "end_interview", "title": "🛑 End Interview"}}])
             except Exception as e:
                 send_whatsapp_message(user_phone, text=f"⚠️ Analysis failed: {e}")
             return {"statusCode": 200}
@@ -226,10 +235,10 @@ def lambda_handler(event, context):
                     text_summary = f"*{eval_json.get('professional_rephrasing', '')}*\n\n*Next Question:* {eval_json.get('next_question', '')}"
                     tts_script = f"{eval_json.get('professional_rephrasing', '')} {eval_json.get('next_question', '')}"
 
-                send_whatsapp_message(user_phone, text=text_summary, buttons=[{"type": "reply", "reply": {"id": "hint", "title": "💡 Hint"}}, {"type": "reply", "reply": {"id": "end_interview", "title": "🛑 End Interview"}}])
-                
+                send_whatsapp_message(user_phone, text=text_summary)
                 if preference != 'text':
                     generate_and_send_polly_audio(user_phone, tts_script)
+                send_whatsapp_message(user_phone, text="Select an option:", buttons=[{"type": "reply", "reply": {"id": "hint", "title": "💡 Hint"}}, {"type": "reply", "reply": {"id": "end_interview", "title": "🛑 End Interview"}}])
             
             except Exception as e:
                 send_whatsapp_message(user_phone, text=f"⚠️ Aira Error: {str(e)}")
@@ -239,10 +248,7 @@ def lambda_handler(event, context):
             send_whatsapp_message(user_phone, text="🎙️ Listening to your audio... please wait.")
             media_id = msg['audio']['id']
             
-            # Anti-Markdown Shield
-            domain = "graph" + ".facebook" + ".com"
-            graph_url = "https://" + domain + "/v18.0/" + media_id
-            
+            graph_url = FB_BASE_URL + media_id
             url_req = urllib.request.Request(graph_url, headers={"Authorization": "Bearer " + META_ACCESS_TOKEN.strip()})
             media_url = json.loads(urllib.request.urlopen(url_req).read().decode())['url']
             audio_req = urllib.request.Request(media_url, headers={"Authorization": "Bearer " + META_ACCESS_TOKEN.strip(), "User-Agent": "Mozilla/5.0"})
@@ -251,6 +257,10 @@ def lambda_handler(event, context):
             job_name = f"job_{user_phone}_{uuid.uuid4().hex[:8]}"
             transcribe.start_transcription_job(TranscriptionJobName=job_name, Media={'MediaFileUri': f"s3://{BUCKET_IN}/{media_id}.ogg"}, MediaFormat='ogg', IdentifyLanguage=True, LanguageOptions=["en-IN", "hi-IN"])
             return {"statusCode": 200}
+
+    except Exception as e:
+        print(f"Global Pipeline Error: {e}")
+        return {"statusCode": 500}
 
     except Exception as e:
         print(f"Global Pipeline Error: {e}")
